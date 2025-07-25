@@ -19,8 +19,8 @@ package org.apache.seata.common.monitor;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
-import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -31,89 +31,108 @@ public class SqlMonitorTest {
     public void setUp() {
         monitor = SqlMonitor.getInstance();
         monitor.resetForTest();
+        monitor.setSlowThreshold(1000);
+        monitor.setMaxSlowEntries(100);
     }
 
     @Test
-    public void testRecordSlowSqlEntry() {
-        monitor.record("SELECT * FROM users", 1500, 100);
-        List<SlowSqlEntry> slowSqlList = monitor.getSlowSqlList();
-        assertEquals(1, slowSqlList.size());
-        SlowSqlEntry entry = slowSqlList.get(0);
-        assertEquals("SELECT * FROM users", entry.getSql());
-        assertTrue(entry.getExecutionTimeMillis() >= 1500);
+    public void recordSlowSql_goesToBothQueues() {
+        monitor.record("SELECT * FROM users", 1500, 10);
+        List<SqlExecutionEntry> slow = monitor.getSlowSqlList();
+        List<SqlExecutionEntry> all = monitor.getAllRecords();
+
+        assertEquals(1, slow.size());
+        assertEquals(1, all.size());
+
+        SqlExecutionEntry e = slow.get(0);
+        assertEquals("SELECT * FROM users", e.getSql());
+        assertTrue(e.getExecutionTimeMillis() >= 1500);
+        assertEquals(e, all.get(0));
     }
 
     @Test
-    public void testRecordMultiSlowEntry() {
-        monitor.record("SELECT * FROM student", 1200, 100);
-        monitor.record("SELECT * FROM school", 1300, 100);
-        List<SlowSqlEntry> slowSqlList = monitor.getSlowSqlList();
-        assertEquals(2, slowSqlList.size());
-        SlowSqlEntry entry1 = slowSqlList.get(0);
-        SlowSqlEntry entry2 = slowSqlList.get(1);
-        assertEquals("SELECT * FROM student", entry1.getSql());
-        assertEquals("SELECT * FROM school", entry2.getSql());
+    public void recordFastSql_onlyInAllRecords() {
+        monitor.record("SELECT * FROM student", 100, 5);
+        assertTrue(monitor.getSlowSqlList().isEmpty());
+        assertEquals(1, monitor.getAllRecordCount());
+        assertEquals("SELECT * FROM student", monitor.getAllRecords().get(0).getSql());
     }
 
     @Test
-    public void testMaxSlowSqlQueueSize() {
-        // maxSlowEntries = 50 by default
-        for (int i = 0; i < 55; i++) {
-            monitor.record("SELECT * FROM orders WHERE id = " + i, 1500, 200);
+    public void slowQueueOverCapacity() {
+        // decrease the capacity for test
+        monitor.setMaxSlowEntries(5);
+        for (int i = 0; i < 7; i++) {
+            monitor.record("SLOW " + i, 2000, 10);
         }
 
-        List<SlowSqlEntry> slowSqlList = monitor.getSlowSqlList();
-        assertEquals(50, slowSqlList.size());
+        List<SqlExecutionEntry> slow = monitor.getSlowSqlList();
+        assertEquals(5, slow.size());
 
-        // Should not contain the first 5 entries
-        for (int i = 0; i < 5; i++) {
-            int finalI = i;
-            assertFalse(
-                    slowSqlList.stream()
-                            .map(SlowSqlEntry::getSql)
-                            .anyMatch(sql -> sql.equals("SELECT * FROM orders WHERE id = " + finalI)),
-                    "Entry with id = " + finalI + " should have been evicted");
+        // Should not contain the first 2 entries
+        for (int i = 0; i < 2; i++) {
+            String sql = "SLOW " + i;
+            assertFalse(slow.stream().anyMatch(e -> e.getSql().equals(sql)),
+                    "Entry " + sql + " should have been evicted");
+        }
+
+        for (int i = 2; i < 7; i++) {
+            String sql = "SLOW " + i;
+            assertTrue(slow.stream().anyMatch(e -> e.getSql().equals(sql)),
+                    "Entry " + sql + " should remain");
         }
     }
 
     @Test
-    public void testRecordForFastSql() {
-        monitor.record("SELECT 1", 100, 50);
-        List<SlowSqlEntry> slowSqlList = monitor.getSlowSqlList();
-        assertTrue(slowSqlList.isEmpty());
+    public void allRecordOverCapacity() {
+        int cap = monitor.getMaxAllRecord();
+
+        // all set to fast SQL
+        for (int i = 0; i < cap + 3; i++) {
+            monitor.record("SQL " + i, 10, 1);
+        }
+
+        assertEquals(cap, monitor.getAllRecordCount());
+
+        List<SqlExecutionEntry> all = monitor.getAllRecords();
+
+        for (int i = 0; i < 3; i++) {
+            String sql = "SQL " + i;
+            assertFalse(all.stream().anyMatch(e -> e.getSql().equals(sql)),
+                    "Entry " + sql + " should have been evicted from allRecord");
+        }
     }
 
-    @Test
-    public void testTxnHistogramBuckets() {
-        monitor.record("SELECT * FROM t1", 30, 0);
-        monitor.record("SELECT * FROM t2", 150, 0);
-        monitor.record("SELECT * FROM t3", 300, 0);
-        monitor.record("SELECT * FROM t4", 800, 0);
-        monitor.record("SELECT * FROM t5", 2000, 0);
-        monitor.record("SELECT * FROM t6", 4000, 0);
 
-        Map<String, Integer> histogram = monitor.getTxnHistogram();
-        assertEquals(1, histogram.get("0-50ms"));
-        assertEquals(1, histogram.get("50-200ms"));
-        assertEquals(1, histogram.get("200-500ms"));
-        assertEquals(1, histogram.get("500ms-1s"));
-        assertEquals(1, histogram.get("1s-3s"));
-        assertEquals(1, histogram.get("3s+"));
+    @Test
+    public void clearOldRecords_removeBeforeGivenTime() throws InterruptedException {
+        monitor.record("old slow", 2000, 1);
+        monitor.record("old fast", 10, 1);
+
+        Thread.sleep(5);
+        Instant cutoff = Instant.now();
+        monitor.record("new slow", 2000, 1);
+        monitor.record("new fast", 10, 1);
+
+        monitor.clearOldRecords(cutoff);
+        assertEquals(1, monitor.getSlowSqlCount());
+        assertEquals("new slow", monitor.getSlowSqlList().get(0).getSql());
+
+        assertEquals(2, monitor.getAllRecordCount());
+        assertTrue(monitor.getAllRecords().stream().anyMatch(e -> e.getSql().equals("new slow")));
+        assertTrue(monitor.getAllRecords().stream().anyMatch(e -> e.getSql().equals("new fast")));
     }
 
-    @Test
-    public void testHoldHistogramBuckets() {
-        monitor.record("SELECT * FROM hold1", 0, 30);
-        monitor.record("SELECT * FROM hold2", 0, 150);
-        monitor.record("SELECT * FROM hold3", 0, 300);
-        monitor.record("SELECT * FROM hold4", 0, 800);
-        monitor.record("SELECT * FROM hold5", 0, 2000);
 
-        Map<String, Integer> histogram = monitor.getHoldHistogram();
-        assertEquals(1, histogram.get("0-50ms"));
-        assertEquals(1, histogram.get("50-200ms"));
-        assertEquals(1, histogram.get("200-500ms"));
-        assertEquals(1, histogram.get("500ms-1s"));
-        assertEquals(1, histogram.get("1s+"));
+
+    @Test
+    public void gettersReturnInternalState() {
+        monitor.record("A", 2000, 1);
+        monitor.record("B", 10, 1);
+        assertEquals(1, monitor.getSlowSqlCount());
+        assertEquals(2, monitor.getAllRecordCount());
+        assertEquals(1000, monitor.getMaxAllRecord());
+        assertEquals(100,  monitor.getMaxSlowEntries());
+        assertEquals(1000L, monitor.getSlowThreshold());
     }
 }
